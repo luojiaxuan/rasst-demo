@@ -37,6 +37,7 @@ DEFAULT_RAG_LOOKBACK_SEC = 1.92
 DEFAULT_MAX_CACHE_CHUNKS = 16
 DEFAULT_KEEP_CACHE_CHUNKS = 8
 DEFAULT_MAX_IMPORTED_GLOSSARY_TERMS = 10000
+DEFAULT_SYSTEM_PROMPT_STYLE = "given_chunks"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -132,7 +133,8 @@ MEDICINE_10K_GLOSSARY = (
     Path("/mnt/gemini/home/jiaxuanluo/medicine_eval_varctx2p88_3p84_4p80_5p76_clean_mfa_exact_only")
     / "medicine_glossary_gt_plus_medicine_wiki_gs10000_translated.json"
 )
-DEFAULT_GLOSSARY_PRESET = "acl_tagged_raw"
+DEFAULT_GLOSSARY_PRESET = "none"
+RAG_STARTUP_GLOSSARY_PRESET = "acl_tagged_raw"
 
 
 def _main_result_index(domain: str, lang_code: str, latency_multiplier: int, filename: str) -> str:
@@ -140,6 +142,13 @@ def _main_result_index(domain: str, lang_code: str, latency_multiplier: int, fil
 
 
 GLOSSARY_PRESETS = {
+    "none": {
+        "id": "none",
+        "label": "None",
+        "path": "",
+        "domain": "none",
+        "index_path": "",
+    },
     "acl_tagged_raw": {
         "id": "acl_tagged_raw",
         "label": "ACL tagged glossary raw",
@@ -239,7 +248,9 @@ class StreamState:
     last_llm_samples: int = 0
     segment_idx: int = 0
     inflight: bool = False
+    messages: List[Dict[str, Any]] = field(default_factory=list)
     history: List[str] = field(default_factory=list)
+    audio_paths: List[Path] = field(default_factory=list)
     imported_glossary: List[Dict[str, Any]] = field(default_factory=list)
     glossary_preset: str = DEFAULT_GLOSSARY_PRESET
     glossary_index_path: str = ""
@@ -330,20 +341,74 @@ def _merge_references(*groups: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
     return merged
 
 
-def _system_prompt(source_lang: str, target_lang: str, lang_code: str, rag_enabled: bool) -> str:
-    if source_lang == "English" and lang_code == "zh":
-        text = (
-            "You are a professional simultaneous interpreter. Translate English "
-            "audio chunks into accurate and fluent Chinese."
+def _use_chinese_training_prompt(source_lang: str, target_lang: str) -> bool:
+    return source_lang.strip().lower() in {"english", "en"} and target_lang.strip().lower() in {
+        "chinese",
+        "zh",
+        "zh-cn",
+        "中文",
+    }
+
+
+def _build_system_prompt(
+    source_lang: str,
+    target_lang: str,
+    system_prompt_style: str,
+    rag_enabled: bool,
+) -> str:
+    if _use_chinese_training_prompt(source_lang, target_lang):
+        return (
+            "You are a professional simultaneous interpreter. "
+            "Your task is to translate English audio chunks into accurate and fluent "
+            "Chinese. Use the ‘term_map’ as a reference for terminology if provided."
+        )
+    if system_prompt_style == "given_chunks":
+        system_text = (
+            f"You are a professional simultaneous interpreter. "
+            f"You will be given chunks of {source_lang} audio and you need to "
+            f"translate the audio into {target_lang} text."
+        )
+    elif system_prompt_style == "translate_task":
+        system_text = (
+            f"You are a professional simultaneous interpreter. "
+            f"Your task is to translate {source_lang} audio chunks into accurate and fluent "
+            f"{target_lang}."
         )
     else:
-        text = (
-            "You are a professional simultaneous interpreter. Translate "
-            f"{source_lang} audio chunks into accurate and fluent {target_lang}."
-        )
+        raise ValueError(f"Unsupported system_prompt_style={system_prompt_style!r}")
     if rag_enabled:
-        text += " Use the term_map as terminology evidence when it is relevant."
-    return text
+        system_text += " Use the 'term_map' as a reference for terminology if provided."
+    return system_text
+
+
+def _append_system_if_needed(
+    state: StreamState,
+    system_prompt_style: str,
+    rag_enabled: bool,
+) -> None:
+    if state.messages:
+        return
+    state.messages.append(
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": _build_system_prompt(
+                        state.source_lang,
+                        state.target_lang,
+                        system_prompt_style,
+                        rag_enabled,
+                    ),
+                }
+            ],
+        }
+    )
+
+
+def _trim_messages(state: StreamState, max_cache_chunks: int, keep_cache_chunks: int) -> None:
+    if len(state.messages) >= 2 * max_cache_chunks + 1:
+        state.messages = [state.messages[0]] + state.messages[-2 * keep_cache_chunks :]
 
 
 class RasstSglangRuntime:
@@ -395,13 +460,16 @@ class RasstSglangRuntime:
             StreamingMaxSimRetriever,
         )
 
-        index_path = self._index_path_for_preset(DEFAULT_GLOSSARY_PRESET, self.lang_cfg["lang_code"])
+        index_path = self._index_path_for_preset(
+            RAG_STARTUP_GLOSSARY_PRESET,
+            self.lang_cfg["lang_code"],
+        )
         self.rag_status = {
             "status": "loading",
             "device": self.args.rag_device,
             "model_path": self.args.rag_model_path,
             "index_path": index_path,
-            "glossary_preset": DEFAULT_GLOSSARY_PRESET,
+            "glossary_preset": RAG_STARTUP_GLOSSARY_PRESET,
         }
         self.retriever = StreamingMaxSimRetriever(
             model_path=self.args.rag_model_path,
@@ -449,7 +517,7 @@ class RasstSglangRuntime:
             return {"status": "error", "error": str(exc)}
 
     def _normalize_preset_id(self, preset_id: Optional[str]) -> str:
-        if not preset_id or preset_id == "none":
+        if not preset_id:
             return DEFAULT_GLOSSARY_PRESET
         if preset_id not in GLOSSARY_PRESETS:
             raise HTTPException(status_code=400, detail=f"Unknown glossary preset: {preset_id}")
@@ -457,6 +525,8 @@ class RasstSglangRuntime:
 
     def _index_path_for_preset(self, preset_id: Optional[str], lang_code: str) -> str:
         preset = GLOSSARY_PRESETS[self._normalize_preset_id(preset_id)]
+        if preset["id"] == "none":
+            return ""
         index_paths = preset.get("index_paths")
         if isinstance(index_paths, dict) and index_paths.get(lang_code):
             return str(index_paths[lang_code])
@@ -535,7 +605,7 @@ class RasstSglangRuntime:
             "manual_terms": len(manual_refs),
             "manual_refs": manual_refs,
             "index_path": index_path,
-            "index_ready": Path(index_path).is_file(),
+            "index_ready": (not index_path) or Path(index_path).is_file(),
         }
 
     async def build_glossary_selection(
@@ -555,12 +625,12 @@ class RasstSglangRuntime:
             glossary_text or "",
             self.lang_cfg["lang_code"],
         )
-        if bool(self.args.rag_enabled) and not selection["index_ready"]:
+        if bool(self.args.rag_enabled) and selection["index_path"] and not selection["index_ready"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"RAG text index is not ready: {selection['index_path']}",
             )
-        if self.retriever is not None:
+        if self.retriever is not None and selection["index_path"]:
             async with self.retriever_lock:
                 await asyncio.to_thread(self._ensure_text_index, selection["index_path"])
         session_updated = False
@@ -703,7 +773,7 @@ class RasstSglangRuntime:
             glossary_text,
             self.lang_cfg["lang_code"],
         )
-        if bool(self.args.rag_enabled) and not selection["index_ready"]:
+        if bool(self.args.rag_enabled) and selection["index_path"] and not selection["index_ready"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"RAG text index is not ready: {selection['index_path']}",
@@ -724,19 +794,31 @@ class RasstSglangRuntime:
 
     def delete_session(self, session_id: str) -> bool:
         removed = self.states.pop(session_id, None)
+        if removed is not None:
+            self._cleanup_session_audio(removed)
         self.session_queues.pop(session_id, None)
         self.pending_set.discard(session_id)
         return removed is not None
+
+    def _cleanup_session_audio(self, state: StreamState) -> None:
+        for path in state.audio_paths:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        state.audio_paths.clear()
 
     def reset_session(self, session_id: str) -> bool:
         state = self.states.get(session_id)
         if state is None:
             return False
+        self._cleanup_session_audio(state)
         state.audio = np.zeros(0, dtype=np.float32)
         state.cursor_samples = 0
         state.last_llm_samples = 0
         state.segment_idx = 0
         state.inflight = False
+        state.messages.clear()
         state.history.clear()
         state.pending_since_s = None
         self.pending_set.discard(session_id)
@@ -880,6 +962,8 @@ class RasstSglangRuntime:
                 state.glossary_preset,
                 state.lang_code,
             )
+            if not index_path:
+                continue
             grouped.setdefault(index_path, []).append((idx, state))
 
         async with self.retriever_lock:
@@ -931,23 +1015,29 @@ class RasstSglangRuntime:
             return {"ok": True, "elapsed_s": 0.0, "skipped": "silence"}
         wav_path = self.tmp_dir / f"{state.session_id}_{state.segment_idx + 1:05d}.wav"
         sf.write(str(wav_path), increment, TARGET_SAMPLE_RATE)
-        prompt = self._build_user_prompt(state, references)
+        state.audio_paths.append(wav_path)
+        rag_enabled_for_prompt = bool(
+            self.args.rag_enabled
+            and (state.glossary_index_path or state.imported_glossary)
+        )
+        _append_system_if_needed(
+            state,
+            system_prompt_style=self.args.system_prompt_style,
+            rag_enabled=rag_enabled_for_prompt,
+        )
+        merged_references = _merge_references(state.imported_glossary, references)
+        user_content: List[Dict[str, Any]] = [{"type": "audio", "audio": str(wav_path)}]
+        term_map = _format_term_map(merged_references, self.args.term_map_format)
+        if term_map:
+            user_content.append({"type": "text", "text": f"\n\nterm_map:\n{term_map}"})
+        elif rag_enabled_for_prompt and self.args.empty_term_map_policy == "none_block":
+            user_content.append({"type": "text", "text": "\n\nterm_map:\nNONE"})
+        user_message = {"role": "user", "content": user_content}
+        state.messages.append(user_message)
         payload = {
             "model": "rasst-qwen3-omni",
             "request_id": f"{state.session_id}-{state.segment_idx + 1}",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": _system_prompt(
-                        state.source_lang,
-                        state.target_lang,
-                        state.lang_code,
-                        rag_enabled=self.retriever is not None,
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "audios": [str(wav_path)],
+            "messages": state.messages,
             "modalities": ["text"],
             "max_tokens": int(self.args.max_new_tokens),
             "temperature": float(self.args.temperature),
@@ -971,6 +1061,12 @@ class RasstSglangRuntime:
             text = str(data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
             state.last_llm_samples = end_sample
             state.segment_idx += 1
+            state.messages.append({"role": "assistant", "content": text})
+            _trim_messages(
+                state,
+                max_cache_chunks=int(self.args.max_cache_chunks),
+                keep_cache_chunks=int(self.args.keep_cache_chunks),
+            )
             if text:
                 state.history.append(text)
                 state.history = state.history[-int(self.args.keep_cache_chunks) :]
@@ -1003,6 +1099,8 @@ class RasstSglangRuntime:
                 )
             return {"ok": True, "elapsed_s": elapsed}
         except Exception as exc:
+            if state.messages and state.messages[-1] is user_message:
+                state.messages.pop()
             queue_for_session = self.session_queues.get(state.session_id)
             if queue_for_session:
                 await queue_for_session.put(
@@ -1013,27 +1111,6 @@ class RasstSglangRuntime:
                     }
                 )
             return {"ok": False, "error": str(exc), "elapsed_s": None}
-        finally:
-            try:
-                wav_path.unlink()
-            except OSError:
-                pass
-
-    def _build_user_prompt(self, state: StreamState, references: Sequence[Dict[str, Any]]) -> str:
-        parts = [
-            "Translate only the current English audio chunk.",
-            "Return only the translation text. Do not explain.",
-        ]
-        if state.history:
-            recent = "\n".join(f"- {item}" for item in state.history[-int(self.args.keep_cache_chunks) :])
-            parts.append(f"Recent translations for context:\n{recent}")
-        merged_references = _merge_references(state.imported_glossary, references)
-        term_map = _format_term_map(merged_references, self.args.term_map_format)
-        if term_map:
-            parts.append(f"term_map:\n{term_map}")
-        elif bool(self.args.rag_enabled) and self.args.empty_term_map_policy == "none_block":
-            parts.append("term_map:\nNONE")
-        return "\n\n".join(parts)
 
 
 app = FastAPI()
@@ -1086,7 +1163,8 @@ async def get_config():
                 "preset_terms": runtime._count_glossary_rows(str(preset.get("path") or "")) if runtime else 0,
                 "index_path": runtime._index_path_for_preset(preset["id"], loaded_lang_code) if runtime else "",
                 "available": (
-                    Path(str(preset.get("path") or "")).exists()
+                    preset["id"] == "none"
+                    or Path(str(preset.get("path") or "")).exists()
                     and (
                         runtime is None
                         or Path(runtime._index_path_for_preset(preset["id"], loaded_lang_code)).is_file()
@@ -1162,7 +1240,7 @@ async def initialize_translation(
         "manual_terms": len(state.imported_glossary),
         "glossary_terms": len(state.imported_glossary),
         "index_path": state.glossary_index_path,
-        "index_ready": Path(state.glossary_index_path).is_file(),
+        "index_ready": (not state.glossary_index_path) or Path(state.glossary_index_path).is_file(),
     }
 
 
@@ -1396,8 +1474,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=float(os.environ.get("RASST_TOP_P", "0.9")))
     parser.add_argument("--top-k", type=int, default=int(os.environ.get("RASST_TOP_K", "50")))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("RASST_SEED", "998244353")))
-    parser.add_argument("--term-map-format", default=os.environ.get("RASST_TERM_MAP_FORMAT", "tagged"))
+    parser.add_argument("--term-map-format", default=os.environ.get("RASST_TERM_MAP_FORMAT", "plain"))
     parser.add_argument("--empty-term-map-policy", default=os.environ.get("RASST_EMPTY_TERM_MAP_POLICY", "none_block"))
+    parser.add_argument(
+        "--system-prompt-style",
+        default=os.environ.get("RASST_SYSTEM_PROMPT_STYLE", DEFAULT_SYSTEM_PROMPT_STYLE),
+        choices=["translate_task", "given_chunks"],
+    )
     parser.add_argument("--max-imported-glossary-terms", type=int, default=int(os.environ.get("RASST_MAX_IMPORTED_GLOSSARY_TERMS", str(DEFAULT_MAX_IMPORTED_GLOSSARY_TERMS))))
     parser.add_argument("--min-audio-rms", type=float, default=float(os.environ.get("RASST_MIN_AUDIO_RMS", "0.001")))
     parser.add_argument("--tmp-dir", default=os.environ.get("RASST_TMP_DIR", f"/dev/shm/rasst_sglang_{os.getpid()}"))
@@ -1412,7 +1495,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if bool(args.rag_enabled) and not Path(args.rag_model_path).is_file():
         raise SystemExit(f"RAG checkpoint not found: {args.rag_model_path}")
     lang_code = LANGUAGE_PAIRS[args.language_pair]["lang_code"]
-    default_index = GLOSSARY_PRESETS[DEFAULT_GLOSSARY_PRESET]["index_paths"][lang_code]
+    default_index = GLOSSARY_PRESETS[RAG_STARTUP_GLOSSARY_PRESET]["index_paths"][lang_code]
     index_path = Path(default_index)
     if bool(args.rag_enabled) and not index_path.is_file():
         raise SystemExit(f"RAG index not found: {index_path}")

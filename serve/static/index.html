@@ -892,13 +892,14 @@
             <div class="glossary-section">
                 <div class="glossary-header">
                     <h2>Imported Glossary</h2>
-                    <div id="glossaryMeta" class="glossary-meta">Preset: ACL tagged glossary raw · Manual: 0 · Pending</div>
+                    <div id="glossaryMeta" class="glossary-meta">Preset: None · Manual: 0 · Pending</div>
                 </div>
                 <div class="glossary-grid">
                     <div class="control-group">
                         <label>Preset</label>
                         <select id="glossaryPreset">
-                            <option value="acl_tagged_raw" selected>ACL tagged glossary raw</option>
+                            <option value="none" selected>None</option>
+                            <option value="acl_tagged_raw">ACL tagged glossary raw</option>
                             <option value="acl_tagged_1k">ACL tagged glossary 1k</option>
                             <option value="acl_tagged_10k">ACL tagged glossary 10k</option>
                             <option value="medicine_raw">Medicine raw glossary</option>
@@ -1095,13 +1096,13 @@
                 .length;
         }
 
-        let serverDefaultGlossaryPreset = 'acl_tagged_raw';
+        let serverDefaultGlossaryPreset = 'none';
         let confirmedGlossary = {
-            preset: 'acl_tagged_raw',
+            preset: 'none',
             text: '',
             manualTerms: 0,
             presetTerms: 0,
-            indexReady: false,
+            indexReady: true,
             indexPath: '',
             confirmedAt: 0
         };
@@ -1115,7 +1116,7 @@
         function updateGlossaryMeta() {
             if (!glossaryMeta) return;
             const selected = glossaryPreset ? glossaryPreset.options[glossaryPreset.selectedIndex] : null;
-            const presetLabel = selected ? selected.textContent : 'ACL tagged glossary raw';
+            const presetLabel = selected ? selected.textContent : 'None';
             const manualCount = countManualGlossaryTerms(glossaryText ? glossaryText.value : '');
             const state = isGlossaryConfirmed() ? 'Ready' : 'Pending';
             glossaryMeta.textContent = `Preset: ${presetLabel} · Manual: ${manualCount} · ${state}`;
@@ -1232,6 +1233,7 @@
         const MIC_SEND_ACTIVE_RATIO_THRESHOLD = 0.015;
         const MIC_SEND_ACTIVE_SAMPLE_THRESHOLD = 0.01;
         let droppedMicChunkCount = 0;
+        const TRANSLATION_PLACEHOLDER = 'Translation will appear here...';
 
         function getAudioStats(samples) {
             if (!samples || samples.length === 0) {
@@ -1289,6 +1291,37 @@
             return true;
         }
 
+        function targetLanguageFromPair() {
+            const pair = languagePair && languagePair.value ? languagePair.value : '';
+            if (pair.includes('Chinese')) return 'zh';
+            if (pair.includes('Japanese')) return 'ja';
+            if (pair.includes('German')) return 'de';
+            return 'default';
+        }
+
+        function joinTranslationText(current, next) {
+            const base = String(current || '').trimEnd();
+            const text = String(next || '').trim();
+            if (!base || base === TRANSLATION_PLACEHOLDER) return text;
+            const targetLang = targetLanguageFromPair();
+            if (targetLang === 'zh' || targetLang === 'ja') {
+                return `${base}${text}`;
+            }
+            if (/^[,.;:!?，。！？；：、)\]}]/.test(text) || /[\s([{]$/.test(base)) {
+                return `${base}${text}`;
+            }
+            return `${base} ${text}`;
+        }
+
+        function clearTranslationOutput() {
+            if (translationOutput) {
+                translationOutput.textContent = TRANSLATION_PLACEHOLDER;
+            }
+            if (isElectron) {
+                updateElectronTranslation('');
+            }
+        }
+
         function renderTranslationMessage(message) {
             const text = String(message || '').trim();
             if (!text) {
@@ -1298,12 +1331,7 @@
             if (isElectron) {
                 updateElectronTranslation(text);
             } else {
-                const currentText = translationOutput.textContent.trim();
-                if (!currentText || currentText === 'Translation will appear here...') {
-                    translationOutput.textContent = text;
-                } else {
-                    translationOutput.textContent = `${translationOutput.textContent.trimEnd()}\n${text}`;
-                }
+                translationOutput.textContent = joinTranslationText(translationOutput.textContent, text);
                 setTimeout(() => {
                     scrollTranslationToBottom();
                 }, 10);
@@ -4067,6 +4095,7 @@
                 volumeLevel.style.width = '0%';
                 volumeIndicator.classList.add('hidden');
                 translationInitialized = false;
+                clearTranslationOutput();
                 
                 const response = await fetch('/reset_translation?' + new URLSearchParams({
                     session_id: sessionId
@@ -4170,6 +4199,7 @@
                 volumeLevel.style.width = '0%';
                 volumeIndicator.classList.add('hidden');
                 translationInitialized = false;
+                clearTranslationOutput();
                 
                 const response = await fetch('/reset_translation?' + new URLSearchParams({
                     session_id: sessionId
